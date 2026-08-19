@@ -21,8 +21,12 @@
 将本项目上传到 GitHub 后，在你的 Linux 服务器上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/deploy.sh | sudo bash -s -- https://github.com/<你的用户名>/<仓库名>.git
+curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/deploy.sh -o deploy.sh && sudo bash deploy.sh https://github.com/<你的用户名>/<仓库名>.git
 ```
+
+> **注意**：脚本包含交互式输入（端口、用户名密码、HTTPS 证书），请用「先下载再执行」的方式，不要直接 `curl | bash`（管道模式下 stdin 被占用会导致输入异常）。脚本已内置管道检测和 `/dev/tty` 自动重定向，但下载后执行更稳妥。
+>
+> 如果在无终端环境执行，脚本会自动使用默认值（代理 8080 / 管理 8081 / admin / admin123 / 不启用 HTTPS）。
 
 脚本会自动完成：安装依赖 → 克隆代码 → 创建虚拟环境 → 安装 Python 包 → 交互式生成配置 → 配置 systemd 服务 → 启动。
 

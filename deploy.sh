@@ -12,6 +12,17 @@ INSTALL_DIR="/opt/agent-proxy"
 SERVICE_NAME="agent-proxy"
 REPO_URL="${1:-}"
 
+# ---- 修复 curl|bash 管道执行时 read 无法交互的问题 ----
+# 管道执行时 stdin 不是终端，read 会读到脚本本身的内容。
+# 尝试重定向到 /dev/tty，失败则使用默认值非交互部署。
+if [ ! -t 0 ]; then
+  if exec </dev/tty 2>/dev/null; then
+    echo ""
+  else
+    NON_INTERACTIVE=1
+  fi
+fi
+
 # ---- 颜色 ----
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -90,52 +101,70 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   info "生成配置文件..."
   cp config.example.yaml "$CONFIG_FILE"
 
-  # 交互式配置
-  echo ""
-  read -rp "代理端口 [8080]: " PROXY_PORT
-  PROXY_PORT="${PROXY_PORT:-8080}"
-  read -rp "管理端口 [8081]: " ADMIN_PORT
-  ADMIN_PORT="${ADMIN_PORT:-8081}"
-  read -rp "管理用户名 [admin]: " ADMIN_USER
-  ADMIN_USER="${ADMIN_USER:-admin}"
-  read -rsp "管理密码: " ADMIN_PASS
-  echo ""
-  while [[ -z "$ADMIN_PASS" ]]; do
-    read -rsp "密码不能为空，请输入: " ADMIN_PASS
+  if [[ "${NON_INTERACTIVE:-0}" == "1" ]]; then
+    warn "非交互模式（无终端），使用默认配置：代理8080 / 管理8081 / 用户名admin / 密码admin123 / 不启用HTTPS"
+    PROXY_PORT="8080"
+    ADMIN_PORT="8081"
+    ADMIN_USER="admin"
+    ADMIN_PASS="admin123"
+    HTTPS_CERT=""
+    HTTPS_KEY=""
+  else
+    # 交互式配置
     echo ""
-  done
-
-  # HTTPS 配置
-  read -rp "是否启用 HTTPS? (y/N): " ENABLE_HTTPS
-  HTTPS_CERT=""
-  HTTPS_KEY=""
-  if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
-    read -rp "证书完整路径 (fullchain.pem): " HTTPS_CERT
-    read -rp "私钥完整路径 (privkey.pem): " HTTPS_KEY
-    while [[ ! -f "$HTTPS_CERT" || ! -f "$HTTPS_KEY" ]]; do
-      warn "证书文件不存在，请重新输入"
-      read -rp "证书完整路径: " HTTPS_CERT
-      read -rp "私钥完整路径: " HTTPS_KEY
+    read -rp "代理端口 [8080]: " PROXY_PORT
+    PROXY_PORT="${PROXY_PORT:-8080}"
+    read -rp "管理端口 [8081]: " ADMIN_PORT
+    ADMIN_PORT="${ADMIN_PORT:-8081}"
+    read -rp "管理用户名 [admin]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-admin}"
+    read -rsp "管理密码: " ADMIN_PASS
+    echo ""
+    while [[ -z "$ADMIN_PASS" ]]; do
+      read -rsp "密码不能为空，请输入: " ADMIN_PASS
+      echo ""
     done
+    # HTTPS 配置
+    read -rp "是否启用 HTTPS? (y/N): " ENABLE_HTTPS
+    HTTPS_CERT=""
+    HTTPS_KEY=""
+    if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+      read -rp "证书完整路径 (fullchain.pem): " HTTPS_CERT
+      read -rp "私钥完整路径 (privkey.pem): " HTTPS_KEY
+      while [[ ! -f "$HTTPS_CERT" || ! -f "$HTTPS_KEY" ]]; do
+        warn "证书文件不存在，请重新输入"
+        read -rp "证书完整路径: " HTTPS_CERT
+        read -rp "私钥完整路径: " HTTPS_KEY
+      done
+    fi
   fi
 
-  # 写入配置
-  python3 - "$CONFIG_FILE" "$PROXY_PORT" "$ADMIN_PORT" "$ADMIN_USER" "$ADMIN_PASS" "$HTTPS_CERT" "$HTTPS_KEY" <<'PYEOF'
-import sys, yaml
-path, proxy_port, admin_port, admin_user, admin_pass, https_cert, https_key = sys.argv[1:8]
+  # 写入配置（通过环境变量传参，避免命令行参数错位）
+  AP_CONFIG_FILE="$CONFIG_FILE" \
+  AP_PROXY_PORT="$PROXY_PORT" \
+  AP_ADMIN_PORT="$ADMIN_PORT" \
+  AP_ADMIN_USER="$ADMIN_USER" \
+  AP_ADMIN_PASS="$ADMIN_PASS" \
+  AP_HTTPS_CERT="$HTTPS_CERT" \
+  AP_HTTPS_KEY="$HTTPS_KEY" \
+  python3 <<'PYEOF'
+import os, yaml
+path = os.environ["AP_CONFIG_FILE"]
 with open(path) as f:
     cfg = yaml.safe_load(f)
-cfg['proxy']['port'] = int(proxy_port)
-cfg['admin']['port'] = int(admin_port)
-cfg['admin']['username'] = admin_user
-cfg['admin']['password'] = admin_pass
-if https_cert and https_key:
+cfg['proxy']['port'] = int(os.environ["AP_PROXY_PORT"])
+cfg['admin']['port'] = int(os.environ["AP_ADMIN_PORT"])
+cfg['admin']['username'] = os.environ["AP_ADMIN_USER"]
+cfg['admin']['password'] = os.environ["AP_ADMIN_PASS"]
+cert = os.environ.get("AP_HTTPS_CERT", "")
+key = os.environ.get("AP_HTTPS_KEY", "")
+if cert and key:
     cfg['proxy']['https']['enabled'] = True
-    cfg['proxy']['https']['cert'] = https_cert
-    cfg['proxy']['https']['key'] = https_key
+    cfg['proxy']['https']['cert'] = cert
+    cfg['proxy']['https']['key'] = key
     cfg['admin']['https']['enabled'] = True
-    cfg['admin']['https']['cert'] = https_cert
-    cfg['admin']['https']['key'] = https_key
+    cfg['admin']['https']['cert'] = cert
+    cfg['admin']['https']['key'] = key
 with open(path, 'w') as f:
     yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
 print("配置已写入")
