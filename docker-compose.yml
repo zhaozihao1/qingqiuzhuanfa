@@ -1,0 +1,24 @@
+services:
+  agent-relay:
+    build: .
+    container_name: agent-relay
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${RELAY_PORT:-8081}:8081"
+      - "${ADMIN_PORT:-8082}:8082"
+    environment:
+      RELAY_PORT: "8081"
+      ADMIN_PORT: "8082"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
+      TRUST_PROXY: "${TRUST_PROXY:-false}"
+    volumes:
+      - agent-relay-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  agent-relay-data:
