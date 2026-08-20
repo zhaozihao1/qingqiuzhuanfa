@@ -14,7 +14,29 @@ fi
 
 command -v curl >/dev/null || { echo "缺少 curl" >&2; exit 1; }
 command -v docker >/dev/null || { echo "缺少 Docker，请先安装 Docker Engine 与 Compose Plugin" >&2; exit 1; }
-docker compose version >/dev/null 2>&1 || { echo "缺少 Docker Compose Plugin" >&2; exit 1; }
+
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then
+  if command -v sudo >/dev/null && sudo -n docker info >/dev/null 2>&1; then
+    DOCKER=(sudo docker)
+    echo "当前用户无 Docker 权限，本次部署自动使用 sudo。"
+  elif [[ -S /var/run/docker.sock ]]; then
+    echo "无法访问 Docker。请先执行以下命令，然后重新登录 SSH：" >&2
+    echo "  sudo usermod -aG docker \$USER" >&2
+    echo "也可以直接用 root 重新执行本部署命令。" >&2
+    exit 1
+  else
+    echo "Docker 服务未运行或无法连接。请先执行：" >&2
+    echo "  sudo systemctl enable --now docker" >&2
+    echo "然后重新运行部署命令。" >&2
+    exit 1
+  fi
+fi
+
+"${DOCKER[@]}" compose version >/dev/null 2>&1 || {
+  echo "缺少 Docker Compose Plugin；请安装 docker-compose-plugin 后重试。" >&2
+  exit 1
+}
 
 mkdir -p "$INSTALL_DIR"
 if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -32,7 +54,9 @@ if [[ ! -f .env ]]; then
   echo "已创建 $INSTALL_DIR/.env，默认管理账号密码均为 admin。"
 fi
 
-docker compose up -d --build
+echo "正在本机生成 qingqiuzhuanfa:local 镜像并启动服务……"
+"${DOCKER[@]}" compose up -d --build
+"${DOCKER[@]}" compose ps
 
 echo
 echo "部署完成："

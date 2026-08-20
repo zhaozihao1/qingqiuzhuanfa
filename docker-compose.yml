@@ -1,5 +1,6 @@
 services:
   agent-relay:
+    image: qingqiuzhuanfa:local
     build: .
     container_name: agent-relay
     restart: unless-stopped

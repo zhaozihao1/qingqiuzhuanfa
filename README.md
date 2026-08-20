@@ -86,6 +86,38 @@ docker compose restart agent-relay
 docker compose down
 ```
 
+## 部署故障排查
+
+### `unable to get image 'agent-relay-agent-relay'`
+
+该名称是旧版 Compose 根据目录和服务名生成的本地镜像名，不是要从 Docker Hub 下载的镜像。新版配置已固定为 `qingqiuzhuanfa:local`，并在启动前执行本机构建。
+
+先把本项目的最新修改推送到 GitHub，然后重新执行一键部署命令。脚本会更新 `~/agent-relay` 并重新构建：
+
+```text
+curl -fsSL https://raw.githubusercontent.com/zhaozihao1/qingqiuzhuanfa/main/install.sh | bash -s -- zhaozihao1/qingqiuzhuanfa
+```
+
+如果仍然失败，请根据完整错误处理：
+
+- 出现 `permission denied while trying to connect to the Docker daemon socket`：
+
+	```text
+	sudo usermod -aG docker $USER
+	```
+
+	然后退出 SSH 并重新登录，再执行部署命令。
+
+- 出现 `Cannot connect to the Docker daemon`：
+
+	```text
+	sudo systemctl enable --now docker
+	```
+
+- 出现 `docker: 'compose' is not a docker command`：安装发行版提供的 Docker Compose Plugin（软件包通常名为 `docker-compose-plugin`）。
+
+安装脚本会检测以上情况；当前用户没有 Docker 权限但支持无密码 `sudo` 时，会自动使用 `sudo docker`。
+
 ## 注意事项
 
 日志包含完整请求和响应正文，可能含有 Token、个人信息或业务敏感数据。请限制 `8082` 管理端口、防火墙只允许可信来源，并妥善备份/保护 Docker volume。
