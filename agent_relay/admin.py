@@ -8,7 +8,6 @@ import json
 import os
 import re
 import secrets
-import shlex
 import sqlite3
 import ssl
 import subprocess
@@ -158,9 +157,8 @@ class AdminServer:
                 content_type="application/json",
             )
         try:
-            args = shlex.split(command)
             result = await asyncio.to_thread(
-                subprocess.run, args, capture_output=True, text=True, timeout=300, check=False
+                subprocess.run, command, shell=True, capture_output=True, text=True, timeout=300, check=False
             )
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             raise web.HTTPBadGateway(

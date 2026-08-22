@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN addgroup -S relay && adduser -S -G relay -u 10001 relay
+RUN apk add --no-cache git docker-cli docker-cli-compose \
+    && addgroup -S relay && adduser -S -G relay -u 10001 relay
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY agent_relay ./agent_relay
