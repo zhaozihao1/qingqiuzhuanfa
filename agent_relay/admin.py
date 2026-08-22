@@ -253,7 +253,7 @@ class AdminServer:
         body = await request.json()
         name = str(body.get("name", "")).strip()
         url = str(body.get("url", "")).strip().rstrip("/")
-        api_key = str(body.get("api_key", "")).strip()
+        api_key = str(body["api_key"]).strip() if "api_key" in body else None
         parsed = urlsplit(url)
         if not name or len(name) > 100 or parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid name or Base URL"}), content_type="application/json")

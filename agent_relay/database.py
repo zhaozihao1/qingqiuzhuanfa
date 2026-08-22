@@ -136,10 +136,13 @@ class Database:
 
         return await self._run(insert)
 
-    async def update_base_url(self, item_id: int, name: str, url: str, auto_replace_key: bool, api_key: str) -> bool:
+    async def update_base_url(self, item_id: int, name: str, url: str, auto_replace_key: bool, api_key: str | None = None) -> bool:
         def update() -> bool:
             with self._connect() as db:
-                cursor = db.execute("UPDATE base_urls SET name=?, url=?, auto_replace_key=?, api_key=? WHERE id=?", (name, url, int(auto_replace_key), api_key, item_id))
+                if api_key is None:
+                    cursor = db.execute("UPDATE base_urls SET name=?, url=?, auto_replace_key=? WHERE id=?", (name, url, int(auto_replace_key), item_id))
+                else:
+                    cursor = db.execute("UPDATE base_urls SET name=?, url=?, auto_replace_key=?, api_key=? WHERE id=?", (name, url, int(auto_replace_key), api_key, item_id))
                 return cursor.rowcount > 0
         return await self._run(update)
 
