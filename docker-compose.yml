@@ -14,7 +14,7 @@ services:
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
-      RELAY_UPDATE_COMMAND: "${RELAY_UPDATE_COMMAND:-git -C /host-project pull --ff-only https://github.com/zhaozihao1/qingqiuzhuanfa.git main && docker compose -f /host-project/docker-compose.yml up -d --build}"
+      RELAY_UPDATE_COMMAND: "${RELAY_UPDATE_COMMAND:-git config --global --add safe.directory /host-project && git -C /host-project pull --ff-only https://github.com/zhaozihao1/qingqiuzhuanfa.git main && docker compose -f /host-project/docker-compose.yml up -d --build}"
     volumes:
       - agent-relay-data:/data
       - /opt/agent-relay:/host-project
