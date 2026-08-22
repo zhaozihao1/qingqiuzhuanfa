@@ -225,6 +225,24 @@ class Database:
 
         return await self._run(query)
 
+    async def delete_all_logs(self) -> int:
+        def delete() -> tuple[int, list[tuple[str, str]]]:
+            with self._connect() as db:
+                rows = db.execute(
+                    "SELECT request_body_path, response_body_path FROM request_logs"
+                ).fetchall()
+                db.execute("DELETE FROM request_logs")
+                return len(rows), [(row[0], row[1]) for row in rows]
+
+        count, paths = await self._run(delete)
+        for pair in paths:
+            for relative_path in pair:
+                try:
+                    (self.data_dir / relative_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return count
+
     async def cleanup_expired(self, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
 

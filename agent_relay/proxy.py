@@ -34,7 +34,9 @@ def _filtered_headers(raw_headers: tuple[tuple[bytes, bytes], ...], *, request: 
     result: CIMultiDict[str] = CIMultiDict()
     blocked = HOP_BY_HOP | connection_tokens
     if request:
-        blocked.add("host")
+        # The request body is an async iterator, so the original length is no
+        # longer authoritative. Let aiohttp select chunked transfer encoding.
+        blocked.update({"host", "content-length"})
     for raw_name, raw_value in raw_headers:
         name = raw_name.decode("latin-1")
         if name.lower() not in blocked:
@@ -47,6 +49,16 @@ def _headers_for_log(raw_headers: tuple[tuple[bytes, bytes], ...]) -> list[list[
 
 
 def build_upstream_url(base_url: str, raw_path: str) -> str:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Invalid active Base URL")
     return base_url.rstrip("/") + (raw_path if raw_path.startswith("/") else f"/{raw_path}")
 
 
@@ -64,7 +76,10 @@ class StreamingProxy:
         request_path = self.database.data_dir / request_relative
         response_path = self.database.data_dir / response_relative
         base_url = await self.database.get_active_base_url()
-        upstream_url = build_upstream_url(base_url, request.raw_path) if base_url else None
+        try:
+            upstream_url = build_upstream_url(base_url, request.raw_path) if base_url else None
+        except ValueError:
+            upstream_url = None
         client_ip = request.remote
 
         await self.database.start_log(
@@ -101,6 +116,14 @@ class StreamingProxy:
                 status = 503
                 error = "No active base URL configured"
                 payload = b'{"error":"No active base URL configured"}'
+                response_path.write_bytes(payload)
+                response_bytes = len(payload)
+                return web.Response(status=status, body=payload, content_type="application/json")
+
+            if upstream_url is None:
+                status = 502
+                error = "Invalid active Base URL"
+                payload = b'{"error":"Invalid active Base URL"}'
                 response_path.write_bytes(payload)
                 response_bytes = len(payload)
                 return web.Response(status=status, body=payload, content_type="application/json")
@@ -142,7 +165,11 @@ class StreamingProxy:
             error = f"{type(exc).__name__}: {exc}"
             if status is None:
                 status = 502
-                payload = (f'{{"error":"Upstream request failed","request_id":"{log_id}"}}').encode()
+                detail = str(exc).replace("\\", "\\\\").replace('"', '\\"')[:500]
+                payload = (
+                    f'{{"error":"Upstream request failed","detail":"{detail}",'
+                    f'"upstream_url":"{upstream_url or ""}","request_id":"{log_id}"}}'
+                ).encode()
                 response_path.write_bytes(payload)
                 response_bytes = len(payload)
                 return web.Response(status=status, body=payload, content_type="application/json")

@@ -8,8 +8,10 @@ import json
 import os
 import re
 import secrets
+import shlex
 import sqlite3
 import ssl
+import subprocess
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -118,7 +120,10 @@ class AdminServer:
                 web.delete(r"/api/base-urls/{item_id:\d+}", self.delete_base_url),
                 web.put("/api/settings/retention", self.set_retention),
                 web.put("/api/settings/tls", self.set_tls),
+                web.get("/api/update/check", self.check_update),
+                web.post("/api/update/apply", self.apply_update),
                 web.get("/api/logs", self.list_logs),
+                web.delete("/api/logs", self.delete_all_logs),
                 web.get(r"/api/logs/{log_id:[a-f0-9]{32}}", self.get_log),
                 web.get(r"/api/logs/{log_id:[a-f0-9]{32}}/{kind:request|response}-body", self.get_body),
             ]
@@ -130,6 +135,43 @@ class AdminServer:
 
     async def health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
+
+    async def check_update(self, request: web.Request) -> web.Response:
+        """Report the configured update command without executing it."""
+        command = os.getenv("RELAY_UPDATE_COMMAND", "").strip()
+        return web.json_response({
+            "configured": bool(command),
+            "message": (
+                "Update command is configured."
+                if command else
+                "Set RELAY_UPDATE_COMMAND on the server to enable one-click updates."
+            ),
+        })
+
+    async def apply_update(self, request: web.Request) -> web.Response:
+        command = os.getenv("RELAY_UPDATE_COMMAND", "").strip()
+        if not command:
+            raise web.HTTPConflict(
+                text=json.dumps({"error": "RELAY_UPDATE_COMMAND is not configured"}),
+                content_type="application/json",
+            )
+        try:
+            args = shlex.split(command)
+            result = await asyncio.to_thread(
+                subprocess.run, args, capture_output=True, text=True, timeout=300, check=False
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise web.HTTPBadGateway(
+                text=json.dumps({"error": f"Update command failed: {exc}"}),
+                content_type="application/json",
+            )
+        output = (result.stdout + result.stderr).strip()[-4000:]
+        if result.returncode != 0:
+            raise web.HTTPBadGateway(
+                text=json.dumps({"error": "Update command returned a failure", "output": output}),
+                content_type="application/json",
+            )
+        return web.json_response({"ok": True, "output": output})
 
     async def login(self, request: web.Request) -> web.Response:
         client_ip = request.remote or "unknown"
@@ -168,12 +210,18 @@ class AdminServer:
 
     async def get_config(self, request: web.Request) -> web.Response:
         settings = await self.database.get_settings()
+        certificate_path = self.database.data_dir / "certificate.pem"
+        private_key_path = self.database.data_dir / "private-key.pem"
+        certificate = certificate_path.read_text(encoding="utf-8") if certificate_path.exists() else ""
+        private_key = private_key_path.read_text(encoding="utf-8") if private_key_path.exists() else ""
         return web.json_response(
             {
                 "base_urls": await self.database.list_base_urls(),
                 "retention_days": int(settings.get("retention_days", "10")),
                 "https_enabled": settings.get("https_enabled") == "true",
                 "certificate_configured": (self.database.data_dir / "certificate.pem").exists(),
+                "certificate": certificate,
+                "private_key": private_key,
                 "default_credentials": self.auth.username == "admin" and self.auth.password == "admin",
             }
         )
@@ -260,6 +308,10 @@ class AdminServer:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid pagination"}), content_type="application/json")
         return web.json_response(await self.database.list_logs(failed_only=failed_only, sort=sort, page=page, page_size=page_size))
 
+    async def delete_all_logs(self, request: web.Request) -> web.Response:
+        deleted = await self.database.delete_all_logs()
+        return web.json_response({"ok": True, "deleted": deleted})
+
     async def get_log(self, request: web.Request) -> web.Response:
         item = await self.database.get_log(request.match_info["log_id"])
         if not item:
@@ -283,4 +335,4 @@ class AdminServer:
             if name.lower() == "content-type":
                 content_type = value.split(";", 1)[0]
                 break
-        return web.FileResponse(path, headers={"Content-Type": content_type, "Content-Disposition": f'attachment; filename="{item["id"]}-{kind}.bin"'})
+        return web.FileResponse(path, headers={"Content-Type": content_type, "Content-Disposition": "inline"})
