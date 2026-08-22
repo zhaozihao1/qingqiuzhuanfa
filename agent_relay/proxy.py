@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import urlsplit
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp import ClientConnectionError, ClientError, ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
 
 from .database import Database
@@ -157,7 +157,7 @@ class StreamingProxy:
                         if not client_disconnected:
                             try:
                                 await downstream.write(chunk)
-                            except (ConnectionError, asyncio.CancelledError):
+                            except (ConnectionError, ClientConnectionError, asyncio.CancelledError):
                                 client_disconnected = True
                 if not client_disconnected:
                     await downstream.write_eof()
@@ -166,6 +166,10 @@ class StreamingProxy:
                 return downstream
         except (ClientError, TimeoutError, ConnectionError, OSError) as exc:
             error = f"{type(exc).__name__}: {exc}"
+            if status is not None and isinstance(exc, (ConnectionError, ClientConnectionError)):
+                client_disconnected = True
+                error = "Downstream client disconnected before response completed"
+                return downstream
             if status is None:
                 status = 502
                 detail = str(exc).replace("\\", "\\\\").replace('"', '\\"')[:500]
@@ -191,6 +195,6 @@ class StreamingProxy:
                     "status": status,
                     "duration_ms": duration_ms,
                     "error": error,
-                    "failed": 1 if error or status is None or status >= 400 else 0,
+                    "failed": 1 if (error and not client_disconnected) or status is None or status >= 400 else 0,
                 },
             )
