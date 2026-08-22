@@ -14,6 +14,7 @@ services:
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
+      RELAY_UPDATE_COMMAND: "${RELAY_UPDATE_COMMAND:-/usr/local/sbin/agent-relay-update}"
     volumes:
       - agent-relay-data:/data
     security_opt:

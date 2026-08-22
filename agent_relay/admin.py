@@ -23,6 +23,7 @@ from aiohttp import web
 from .database import Database
 
 SESSION_COOKIE = "relay_admin_session"
+DEFAULT_UPDATE_COMMAND = "/usr/local/sbin/agent-relay-update"
 PEM_CERTIFICATE = re.compile(r"-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----")
 PEM_PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----[\s\S]+-----END (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----")
 
@@ -138,18 +139,18 @@ class AdminServer:
 
     async def check_update(self, request: web.Request) -> web.Response:
         """Report the configured update command without executing it."""
-        command = os.getenv("RELAY_UPDATE_COMMAND", "").strip()
+        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
         return web.json_response({
             "configured": bool(command),
             "message": (
                 "Update command is configured."
                 if command else
-                "Set RELAY_UPDATE_COMMAND on the server to enable one-click updates."
+                "Configure RELAY_UPDATE_COMMAND to change the controlled update command."
             ),
         })
 
     async def apply_update(self, request: web.Request) -> web.Response:
-        command = os.getenv("RELAY_UPDATE_COMMAND", "").strip()
+        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
         if not command:
             raise web.HTTPConflict(
                 text=json.dumps({"error": "RELAY_UPDATE_COMMAND is not configured"}),
