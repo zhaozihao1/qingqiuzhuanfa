@@ -62,7 +62,7 @@ docker compose up -d --build
 管理页面的“系统更新”功能默认启用，使用宿主机上的受控脚本执行更新。默认命令路径为 `/usr/local/sbin/agent-relay-update`，也可以通过容器环境变量 `RELAY_UPDATE_COMMAND` 覆盖：
 
 ```dotenv
-RELAY_UPDATE_COMMAND=git -C /host-project pull --ff-only https://github.com/zhaozihao1/qingqiuzhuanfa.git main && docker compose -f /host-project/docker-compose.yml up -d --build
+RELAY_UPDATE_COMMAND=docker rm -f agent-relay-updater >/dev/null 2>&1 || true; docker run -d --rm --name agent-relay-updater -v /opt/agent-relay:/host-project -v /var/run/docker.sock:/var/run/docker.sock qingqiuzhuanfa:local sh -c "sleep 2; git config --global --add safe.directory /host-project; git -C /host-project pull --ff-only https://github.com/zhaozihao1/qingqiuzhuanfa.git main; docker rm -f agent-relay >/dev/null 2>&1 || true; docker compose -f /host-project/docker-compose.yml up -d --build"
 ```
 
 安装脚本会将该默认配置写入 `.env`。请在宿主机创建此受控脚本，负责 `git pull --ff-only` 和 `docker compose up -d --build`，并限制为 root 可执行；不要把任意 shell 输入暴露给管理页面。
