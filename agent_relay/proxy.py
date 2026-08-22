@@ -45,7 +45,7 @@ def _filtered_headers(raw_headers: tuple[tuple[bytes, bytes], ...], *, request: 
 
 
 def _headers_for_log(raw_headers: tuple[tuple[bytes, bytes], ...]) -> list[list[str]]:
-    return [[name.decode("latin-1"), value.decode("latin-1")] for name, value in raw_headers]
+    return [[name.decode("latin-1"), "[REDACTED]" if name.lower() in {b"authorization", b"proxy-authorization"} else value.decode("latin-1")] for name, value in raw_headers]
 
 
 def build_upstream_url(base_url: str, raw_path: str) -> str:
@@ -75,7 +75,8 @@ class StreamingProxy:
         response_relative = f"bodies/{log_id}.response.bin"
         request_path = self.database.data_dir / request_relative
         response_path = self.database.data_dir / response_relative
-        base_url = await self.database.get_active_base_url()
+        upstream = await self.database.get_active_base_url()
+        base_url = upstream["url"] if upstream else None
         try:
             upstream_url = build_upstream_url(base_url, request.raw_path) if base_url else None
         except ValueError:
@@ -131,6 +132,8 @@ class StreamingProxy:
             headers = _filtered_headers(request.raw_headers, request=True)
             parsed = urlsplit(base_url)
             headers["Host"] = parsed.netloc
+            if upstream and upstream.get("auto_replace_key") and upstream.get("api_key"):
+                headers["Authorization"] = f"Bearer {upstream['api_key']}"
             timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
             async with self.session.request(
                 request.method,

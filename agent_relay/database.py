@@ -37,6 +37,8 @@ class Database:
                     name TEXT NOT NULL,
                     url TEXT NOT NULL UNIQUE,
                     active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+                    auto_replace_key INTEGER NOT NULL DEFAULT 0 CHECK(auto_replace_key IN (0, 1)),
+                    api_key TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_base_url
@@ -78,6 +80,11 @@ class Database:
             db.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES('https_enabled', 'false')"
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(base_urls)")}
+            if "auto_replace_key" not in columns:
+                db.execute("ALTER TABLE base_urls ADD COLUMN auto_replace_key INTEGER NOT NULL DEFAULT 0")
+            if "api_key" not in columns:
+                db.execute("ALTER TABLE base_urls ADD COLUMN api_key TEXT NOT NULL DEFAULT ''")
 
     async def _run(self, function: Any, *args: Any) -> Any:
         async with self._lock:
@@ -108,26 +115,33 @@ class Database:
 
         return await self._run(query)
 
-    async def get_active_base_url(self) -> str | None:
-        def query() -> str | None:
+    async def get_active_base_url(self) -> dict[str, Any] | None:
+        def query() -> dict[str, Any] | None:
             with self._connect() as db:
-                row = db.execute("SELECT url FROM base_urls WHERE active = 1").fetchone()
-                return str(row["url"]) if row else None
+                row = db.execute("SELECT * FROM base_urls WHERE active = 1").fetchone()
+                return dict(row) if row else None
 
         return await self._run(query)
 
-    async def add_base_url(self, name: str, url: str) -> dict[str, Any]:
+    async def add_base_url(self, name: str, url: str, auto_replace_key: bool = False, api_key: str = "") -> dict[str, Any]:
         def insert() -> dict[str, Any]:
             with self._connect() as db:
                 has_active = db.execute("SELECT 1 FROM base_urls WHERE active = 1").fetchone()
                 cursor = db.execute(
-                    "INSERT INTO base_urls(name, url, active, created_at) VALUES(?, ?, ?, ?)",
-                    (name, url, 0 if has_active else 1, datetime.now(UTC).isoformat()),
+                    "INSERT INTO base_urls(name, url, active, auto_replace_key, api_key, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                    (name, url, 0 if has_active else 1, int(auto_replace_key), api_key, datetime.now(UTC).isoformat()),
                 )
                 row = db.execute("SELECT * FROM base_urls WHERE id = ?", (cursor.lastrowid,)).fetchone()
                 return dict(row)
 
         return await self._run(insert)
+
+    async def update_base_url(self, item_id: int, name: str, url: str, auto_replace_key: bool, api_key: str) -> bool:
+        def update() -> bool:
+            with self._connect() as db:
+                cursor = db.execute("UPDATE base_urls SET name=?, url=?, auto_replace_key=?, api_key=? WHERE id=?", (name, url, int(auto_replace_key), api_key, item_id))
+                return cursor.rowcount > 0
+        return await self._run(update)
 
     async def delete_base_url(self, item_id: int) -> bool:
         def delete() -> bool:

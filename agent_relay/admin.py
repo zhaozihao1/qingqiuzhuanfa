@@ -117,6 +117,7 @@ class AdminServer:
                 web.get("/api/session", self.session),
                 web.get("/api/config", self.get_config),
                 web.post("/api/base-urls", self.add_base_url),
+                web.put(r"/api/base-urls/{item_id:\d+}", self.update_base_url),
                 web.post(r"/api/base-urls/{item_id:\d+}/activate", self.activate_base_url),
                 web.delete(r"/api/base-urls/{item_id:\d+}", self.delete_base_url),
                 web.put("/api/settings/retention", self.set_retention),
@@ -215,9 +216,13 @@ class AdminServer:
         private_key_path = self.database.data_dir / "private-key.pem"
         certificate = certificate_path.read_text(encoding="utf-8") if certificate_path.exists() else ""
         private_key = private_key_path.read_text(encoding="utf-8") if private_key_path.exists() else ""
+        base_urls = await self.database.list_base_urls()
+        for item in base_urls:
+            item["api_key_configured"] = bool(item.pop("api_key", ""))
+            item["api_key"] = ""
         return web.json_response(
             {
-                "base_urls": await self.database.list_base_urls(),
+                "base_urls": base_urls,
                 "retention_days": int(settings.get("retention_days", "10")),
                 "https_enabled": settings.get("https_enabled") == "true",
                 "certificate_configured": (self.database.data_dir / "certificate.pem").exists(),
@@ -231,16 +236,32 @@ class AdminServer:
         body = await request.json()
         name = str(body.get("name", "")).strip()
         url = str(body.get("url", "")).strip().rstrip("/")
+        api_key = str(body.get("api_key", "")).strip()
+        auto_replace_key = bool(body.get("auto_replace_key"))
         parsed = urlsplit(url)
         if not name or len(name) > 100:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Name is required (max 100 characters)"}), content_type="application/json")
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
             raise web.HTTPBadRequest(text=json.dumps({"error": "A valid HTTP/HTTPS base URL without credentials, query, or fragment is required"}), content_type="application/json")
         try:
-            item = await self.database.add_base_url(name, url)
+            item = await self.database.add_base_url(name, url, auto_replace_key, api_key)
         except sqlite3.IntegrityError:
             raise web.HTTPConflict(text=json.dumps({"error": "Base URL already exists"}), content_type="application/json")
+        item["api_key_configured"] = bool(item.pop("api_key", ""))
         return web.json_response(item, status=201)
+
+    async def update_base_url(self, request: web.Request) -> web.Response:
+        item_id = int(request.match_info["item_id"])
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        url = str(body.get("url", "")).strip().rstrip("/")
+        api_key = str(body.get("api_key", "")).strip()
+        parsed = urlsplit(url)
+        if not name or len(name) > 100 or parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
+            raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid name or Base URL"}), content_type="application/json")
+        if not await self.database.update_base_url(item_id, name, url, bool(body.get("auto_replace_key")), api_key):
+            raise web.HTTPNotFound()
+        return web.json_response({"ok": True})
 
     async def activate_base_url(self, request: web.Request) -> web.Response:
         if not await self.database.activate_base_url(int(request.match_info["item_id"])):

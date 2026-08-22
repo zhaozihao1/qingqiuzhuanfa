@@ -5,6 +5,7 @@
 ## 关键行为
 
 - 支持配置多个 `http://` / `https://` Base URL，但只允许一个生效。
+- 每个上游可单独保存 API 密钥并选择“自动替换 Authorization”；切换上游即可自动使用对应密钥。关闭时会透传客户端原始 Authorization。
 - 转发地址为：`生效 Base URL + 客户端原始 path/query`。例如 Base URL 为 `https://api.example.com/v1`，客户端请求 `/chat/completions`，上游地址为 `https://api.example.com/v1/chat/completions`。
 - 使用流式读写，不等待完整响应，适合 SSE、chunked response 和 Agent 流式输出。
 - 默认**只启用 HTTP 转发**：8081 收到 HTTPS 不会被支持，也不会记录；不会做无效的 HTTPS 直通。
