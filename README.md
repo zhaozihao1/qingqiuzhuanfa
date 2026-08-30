@@ -7,7 +7,9 @@
 - 支持配置多个 `http://` / `https://` Base URL，但只允许一个生效。
 - 每个上游可单独保存 API 密钥并选择“自动替换 Authorization”；切换上游即可自动使用对应密钥。关闭时会透传客户端原始 Authorization。
 - 转发地址为：`生效 Base URL + 客户端原始 path/query`。例如 Base URL 为 `https://api.example.com/v1`，客户端请求 `/chat/completions`，上游地址为 `https://api.example.com/v1/chat/completions`。
-- 使用流式读写，不等待完整响应，适合 SSE、chunked response 和 Agent 流式输出。
+- 使用流式读写，不等待完整响应；上游一有可读字节就立即转发，适合 SSE、chunked response 和 Agent 流式输出。
+- 转发层不解析或重组 JSON/SSE，`reasoning_content`、`thinking`、增量 `tool_calls` 等字段均按原始字节和原顺序透传。
+- SSE 响应自动附加 `X-Accel-Buffering: no`，避免常见 Nginx 配置缓存整个响应；如果前面还有 CDN 或其他反向代理，仍需在对应服务中关闭响应缓冲。
 - 默认**只启用 HTTP 转发**：8081 收到 HTTPS 不会被支持，也不会记录；不会做无效的 HTTPS 直通。
 - 在管理端上传服务器证书和私钥并启用后，8081 才切换为 HTTPS，终止 TLS、按路径转发并记录 HTTPS 内容。8082 管理页面始终为 HTTP。
 - 记录请求/响应头、正文、状态码、耗时和失败原因；正文按流写入磁盘。
@@ -138,3 +140,5 @@ curl -fsSL https://raw.githubusercontent.com/zhaozihao1/qingqiuzhuanfa/main/inst
 ## 注意事项
 
 日志包含完整请求和响应正文，可能含有 Token、个人信息或业务敏感数据。请限制 `8082` 管理端口、防火墙只允许可信来源，并妥善备份/保护 Docker volume。
+
+流式客户端必须按 SSE 的空行事件边界解析数据，不能假设一次网络读取恰好等于一个 JSON、一个 token 或一个 tool call 增量。部分模型或上游 API 本身不会返回可见思考内容，此时转发器无法生成上游未提供的字段。

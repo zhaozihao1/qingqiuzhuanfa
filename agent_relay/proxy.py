@@ -146,19 +146,27 @@ class StreamingProxy:
             ) as upstream:
                 status = upstream.status
                 outgoing_headers = _filtered_headers(upstream.raw_headers, request=False)
+                if upstream.headers.get("Content-Type", "").lower().startswith("text/event-stream"):
+                    # Disable buffering in commonly used nginx deployments. The
+                    # body itself remains byte-for-byte transparent.
+                    outgoing_headers.setdefault("X-Accel-Buffering", "no")
                 response_headers = _headers_for_log(upstream.raw_headers)
                 downstream = web.StreamResponse(status=status, reason=upstream.reason, headers=outgoing_headers)
                 await downstream.prepare(request)
 
                 with response_path.open("wb") as body_file:
-                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    # Forward whatever is currently available instead of waiting
+                    # for a particular chunk size. SSE framing is still preserved
+                    # as raw bytes and remains the client's responsibility.
+                    async for chunk in upstream.content.iter_any():
                         body_file.write(chunk)
                         response_bytes += len(chunk)
-                        if not client_disconnected:
-                            try:
-                                await downstream.write(chunk)
-                            except (ConnectionError, ClientConnectionError, asyncio.CancelledError):
-                                client_disconnected = True
+                        try:
+                            await downstream.write(chunk)
+                        except (ConnectionError, ClientConnectionError):
+                            client_disconnected = True
+                            upstream.close()
+                            break
                 if not client_disconnected:
                     await downstream.write_eof()
                 if client_disconnected:

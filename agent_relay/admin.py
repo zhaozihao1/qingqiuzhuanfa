@@ -350,9 +350,16 @@ class AdminServer:
         if self.database.data_dir.resolve() not in path.parents or not path.is_file():
             raise web.HTTPNotFound()
         content_type = "application/octet-stream"
+        content_encoding = None
         headers = item[f"{kind}_headers"]
         for name, value in headers:
             if name.lower() == "content-type":
-                content_type = value.split(";", 1)[0]
-                break
-        return web.FileResponse(path, headers={"Content-Type": content_type, "Content-Disposition": "inline"})
+                content_type = value
+            elif name.lower() == "content-encoding":
+                content_encoding = value
+        outgoing_headers = {"Content-Type": content_type, "Content-Disposition": "inline"}
+        if content_encoding:
+            # Logged bodies contain the exact encoded upstream bytes. Restoring
+            # this header lets browsers decode gzip/br content before displaying it.
+            outgoing_headers["Content-Encoding"] = content_encoding
+        return web.FileResponse(path, headers=outgoing_headers)
