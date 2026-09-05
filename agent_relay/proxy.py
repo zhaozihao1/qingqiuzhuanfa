@@ -23,7 +23,7 @@ HOP_BY_HOP = {
     "transfer-encoding",
     "upgrade",
 }
-MAX_DENIED_BODY_BYTES = 1024 * 1024
+MAX_DENIED_BODY_BYTES = 10 * 1024 * 1024
 
 
 def _filtered_headers(raw_headers: tuple[tuple[bytes, bytes], ...], *, request: bool) -> CIMultiDict[str]:
@@ -47,6 +47,10 @@ def _filtered_headers(raw_headers: tuple[tuple[bytes, bytes], ...], *, request: 
 
 def _headers_for_log(raw_headers: tuple[tuple[bytes, bytes], ...]) -> list[list[str]]:
     return [[name.decode("latin-1"), "[REDACTED]" if name.lower() in {b"authorization", b"proxy-authorization"} else value.decode("latin-1")] for name, value in raw_headers]
+
+
+def _headers_without_redaction(raw_headers: tuple[tuple[bytes, bytes], ...]) -> list[list[str]]:
+    return [[name.decode("latin-1"), value.decode("latin-1")] for name, value in raw_headers]
 
 
 def _provided_access_key(request: web.Request) -> str:
@@ -102,7 +106,7 @@ class StreamingProxy:
                 "started_at": started.isoformat(),
                 "method": request.method,
                 "incoming_url": request.raw_path,
-                "request_headers": _headers_for_log(request.raw_headers),
+                "request_headers": _headers_without_redaction(request.raw_headers),
                 "client_ip": request.remote,
                 "request_body_path": request_relative,
                 "request_bytes": captured_bytes,

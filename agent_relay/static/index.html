@@ -28,7 +28,7 @@
   </section>
   <section id="tab-denied" class="card hidden" style="margin-top:16px">
     <div class="toolbar"><div><h2>拒绝请求统计</h2><span id="denied-total" class="muted"></span></div><div class="filters"><button class="ghost" id="denied-sort">时间：新 → 旧</button><button class="ghost" id="denied-refresh">刷新</button><button class="danger" id="delete-denied">删除全部记录</button></div></div>
-    <p class="muted">未携带有效入口密钥的请求会被静默断开。保存脱敏请求头与最多 1 MiB 请求体，便于判断扫描内容。</p><div id="denied-logs"></div><div class="pager"><button class="ghost" id="denied-prev">上一页</button><span id="denied-page"></span><button class="ghost" id="denied-next">下一页</button></div>
+    <p class="muted">未携带有效入口密钥的请求会被静默断开。原样保存请求头与最多 10 MiB 请求体，可能包含密钥等敏感信息。</p><div id="denied-logs"></div><div class="pager"><button class="ghost" id="denied-prev">上一页</button><span id="denied-page"></span><button class="ghost" id="denied-next">下一页</button></div>
   </section>
   <section id="tab-upstreams" class="hidden grid" style="margin-top:16px">
     <div class="card half"><h2>新增 Base URL</h2><form id="url-form"><label>显示名称</label><input name="name" placeholder="例如 OpenAI 主线路" required maxlength="100"><label>HTTP/HTTPS Base URL</label><input name="url" type="url" placeholder="https://api.example.com/v1" required><label>上游 API 密钥（可选）</label><input name="api_key" type="password" autocomplete="new-password" placeholder="sk-..."><label><input name="auto_replace_key" type="checkbox" style="width:auto"> 启用后自动替换 Authorization</label><div class="actions"><button class="primary">添加</button></div></form></div>

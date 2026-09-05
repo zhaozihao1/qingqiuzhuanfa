@@ -166,7 +166,7 @@ async def test_invalid_access_key_is_silently_disconnected_and_logged(tmp_path: 
     detail = await database.get_denied_log(denied["items"][0]["id"])
     assert detail is not None
     assert detail["incoming_url"] == "/probe"
-    assert ["Authorization", "[REDACTED]"] in detail["request_headers"]
+    assert ["Authorization", "Bearer wrong-key"] in detail["request_headers"]
     assert detail["request_bytes"] > 0
     assert b"scanner-payload" in (database.data_dir / detail["request_body_path"]).read_bytes()
 
