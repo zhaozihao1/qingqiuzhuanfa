@@ -116,6 +116,7 @@ class AdminServer:
             web.post("/api/login", self.login), web.post("/api/forgot-password", self.forgot_password),
             web.post("/api/logout", self.logout), web.get("/api/session", self.session),
             web.put("/api/settings/password", self.change_password), web.get("/api/config", self.get_config),
+            web.put("/api/settings/access-key", self.set_access_key_enabled),
             web.post("/api/access-keys", self.add_access_key),
             web.delete(r"/api/access-keys/{item_id:\d+}", self.delete_access_key),
             web.post("/api/base-urls", self.add_base_url),
@@ -129,6 +130,7 @@ class AdminServer:
             web.get(r"/api/logs/{log_id:[a-f0-9]{32}}/{kind:request|response}-body", self.get_body),
             web.get("/api/denied-logs", self.list_denied_logs), web.delete("/api/denied-logs", self.delete_all_denied_logs),
             web.get(r"/api/denied-logs/{log_id:[a-f0-9]{32}}", self.get_denied_log),
+            web.get(r"/api/denied-logs/{log_id:[a-f0-9]{32}}/request-body", self.get_denied_body),
         ])
         return app
 
@@ -199,12 +201,21 @@ class AdminServer:
             item["masked_key"] = f"{item.pop('key_prefix')}••••••••{item.pop('key_suffix')}"
         return web.json_response({
             "base_urls": base_urls, "access_keys": access_keys,
+            "access_key_enabled": settings.get("access_key_enabled", "false") == "true",
             "retention_days": int(settings.get("retention_days", "10")),
             "https_enabled": settings.get("https_enabled") == "true",
             "certificate_configured": cert_path.exists() and key_path.exists(),
             "certificate": cert_path.read_text(encoding="utf-8") if cert_path.exists() else "", "private_key": "",
             "default_credentials": self.auth.username == "admin" and await self.database.verify_admin_password("admin"),
         })
+
+    async def set_access_key_enabled(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+        if enabled and not await self.database.list_access_keys():
+            raise web.HTTPConflict(text=json.dumps({"error": "Add at least one access key before enabling protection"}), content_type="application/json")
+        await self.database.set_settings({"access_key_enabled": "true" if enabled else "false"})
+        return web.json_response({"ok": True, "enabled": enabled})
 
     async def add_access_key(self, request: web.Request) -> web.Response:
         body = await request.json()
@@ -366,4 +377,19 @@ class AdminServer:
         item = await self.database.get_denied_log(request.match_info["log_id"])
         if not item:
             raise web.HTTPNotFound()
+        item.pop("request_body_path", None)
         return web.json_response(item)
+
+    async def get_denied_body(self, request: web.Request) -> web.StreamResponse:
+        item = await self.database.get_denied_log(request.match_info["log_id"])
+        if not item or not item.get("request_body_path"):
+            raise web.HTTPNotFound()
+        path = (self.database.data_dir / item["request_body_path"]).resolve()
+        if self.database.data_dir.resolve() not in path.parents or not path.is_file():
+            raise web.HTTPNotFound()
+        content_type = "application/octet-stream"
+        for name, value in item["request_headers"]:
+            if name.lower() == "content-type":
+                content_type = value
+                break
+        return web.FileResponse(path, headers={"Content-Type": content_type, "Content-Disposition": "inline"})

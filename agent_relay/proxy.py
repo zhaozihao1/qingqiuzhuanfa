@@ -23,6 +23,7 @@ HOP_BY_HOP = {
     "transfer-encoding",
     "upgrade",
 }
+MAX_DENIED_BODY_BYTES = 1024 * 1024
 
 
 def _filtered_headers(raw_headers: tuple[tuple[bytes, bytes], ...], *, request: bool) -> CIMultiDict[str]:
@@ -81,7 +82,21 @@ class StreamingProxy:
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
         log_id = uuid.uuid4().hex
-        if not await self.database.access_key_allowed(_provided_access_key(request)):
+        if await self.database.access_key_required() and not await self.database.access_key_allowed(_provided_access_key(request)):
+            request_relative = f"bodies/{log_id}.denied-request.bin"
+            request_path = self.database.data_dir / request_relative
+            captured_bytes = 0
+            body_truncated = False
+            with request_path.open("wb") as body_file:
+                async for chunk in request.content.iter_chunked(64 * 1024):
+                    remaining = MAX_DENIED_BODY_BYTES - captured_bytes
+                    if remaining > 0:
+                        written = chunk[:remaining]
+                        body_file.write(written)
+                        captured_bytes += len(written)
+                    if len(chunk) > remaining or captured_bytes >= MAX_DENIED_BODY_BYTES:
+                        body_truncated = True
+                        break
             await self.database.add_denied_log({
                 "id": log_id,
                 "started_at": started.isoformat(),
@@ -89,6 +104,9 @@ class StreamingProxy:
                 "incoming_url": request.raw_path,
                 "request_headers": _headers_for_log(request.raw_headers),
                 "client_ip": request.remote,
+                "request_body_path": request_relative,
+                "request_bytes": captured_bytes,
+                "body_truncated": body_truncated,
             })
             transport = request.transport
             if transport is not None:

@@ -112,7 +112,10 @@ class Database:
                     method TEXT NOT NULL,
                     incoming_url TEXT NOT NULL,
                     request_headers TEXT NOT NULL,
-                    client_ip TEXT
+                    client_ip TEXT,
+                    request_body_path TEXT NOT NULL DEFAULT '',
+                    request_bytes INTEGER NOT NULL DEFAULT 0,
+                    body_truncated INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS denied_request_logs_started_at
                     ON denied_request_logs(started_at DESC);
@@ -125,6 +128,9 @@ class Database:
                 "INSERT OR IGNORE INTO settings(key, value) VALUES('https_enabled', 'false')"
             )
             db.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('access_key_enabled', 'false')"
+            )
+            db.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES('admin_password_hash', ?)",
                 (_hash_password(os.getenv("ADMIN_PASSWORD", "admin")),),
             )
@@ -133,6 +139,13 @@ class Database:
                 db.execute("ALTER TABLE base_urls ADD COLUMN auto_replace_key INTEGER NOT NULL DEFAULT 0")
             if "api_key" not in columns:
                 db.execute("ALTER TABLE base_urls ADD COLUMN api_key TEXT NOT NULL DEFAULT ''")
+            denied_columns = {row["name"] for row in db.execute("PRAGMA table_info(denied_request_logs)")}
+            if "request_body_path" not in denied_columns:
+                db.execute("ALTER TABLE denied_request_logs ADD COLUMN request_body_path TEXT NOT NULL DEFAULT ''")
+            if "request_bytes" not in denied_columns:
+                db.execute("ALTER TABLE denied_request_logs ADD COLUMN request_bytes INTEGER NOT NULL DEFAULT 0")
+            if "body_truncated" not in denied_columns:
+                db.execute("ALTER TABLE denied_request_logs ADD COLUMN body_truncated INTEGER NOT NULL DEFAULT 0")
 
     async def _run(self, function: Any, *args: Any) -> Any:
         async with self._lock:
@@ -167,12 +180,15 @@ class Database:
         return True
 
     async def reset_platform(self) -> None:
-        def reset() -> list[tuple[str, str]]:
+        def reset() -> tuple[list[tuple[str, str]], list[str]]:
             with self._connect() as db:
                 paths = [(row[0], row[1]) for row in db.execute(
                     "SELECT request_body_path, response_body_path FROM request_logs"
                 )]
                 db.execute("DELETE FROM request_logs")
+                denied_paths = [row[0] for row in db.execute(
+                    "SELECT request_body_path FROM denied_request_logs WHERE request_body_path != ''"
+                )]
                 db.execute("DELETE FROM denied_request_logs")
                 db.execute("DELETE FROM access_keys")
                 db.execute("DELETE FROM base_urls")
@@ -182,18 +198,24 @@ class Database:
                     [
                         ("retention_days", "10"),
                         ("https_enabled", "false"),
+                        ("access_key_enabled", "false"),
                         ("admin_password_hash", _hash_password("admin")),
                     ],
                 )
-                return paths
+                return paths, denied_paths
 
-        paths = await self._run(reset)
+        paths, denied_paths = await self._run(reset)
         for pair in paths:
             for relative_path in pair:
                 try:
                     (self.data_dir / relative_path).unlink(missing_ok=True)
                 except OSError:
                     pass
+        for relative_path in denied_paths:
+            try:
+                (self.data_dir / relative_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         for name in ("certificate.pem", "private-key.pem"):
             try:
                 (self.data_dir / name).unlink(missing_ok=True)
@@ -236,13 +258,18 @@ class Database:
                 return any(hmac.compare_digest(candidate, value) for value in hashes)
         return await self._run(query)
 
+    async def access_key_required(self) -> bool:
+        settings = await self.get_settings()
+        return settings.get("access_key_enabled", "false") == "true"
+
     async def add_denied_log(self, values: dict[str, Any]) -> None:
         def insert() -> None:
             with self._connect() as db:
                 db.execute(
-                    "INSERT INTO denied_request_logs(id, started_at, method, incoming_url, request_headers, client_ip) VALUES(?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO denied_request_logs(id, started_at, method, incoming_url, request_headers, client_ip, request_body_path, request_bytes, body_truncated) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (values["id"], values["started_at"], values["method"], values["incoming_url"],
-                     json.dumps(values["request_headers"], ensure_ascii=False), values.get("client_ip")),
+                     json.dumps(values["request_headers"], ensure_ascii=False), values.get("client_ip"),
+                     values.get("request_body_path", ""), values.get("request_bytes", 0), int(values.get("body_truncated", False))),
                 )
         await self._run(insert)
 
@@ -253,7 +280,7 @@ class Database:
             with self._connect() as db:
                 total = int(db.execute("SELECT COUNT(*) FROM denied_request_logs").fetchone()[0])
                 rows = db.execute(
-                    f"SELECT id, started_at, method, incoming_url, client_ip FROM denied_request_logs ORDER BY started_at {direction} LIMIT ? OFFSET ?",
+                    f"SELECT id, started_at, method, incoming_url, client_ip, request_bytes, body_truncated FROM denied_request_logs ORDER BY started_at {direction} LIMIT ? OFFSET ?",
                     (page_size, offset),
                 ).fetchall()
                 return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
@@ -271,12 +298,21 @@ class Database:
         return await self._run(query)
 
     async def delete_all_denied_logs(self) -> int:
-        def delete() -> int:
+        def delete() -> tuple[int, list[str]]:
             with self._connect() as db:
                 count = int(db.execute("SELECT COUNT(*) FROM denied_request_logs").fetchone()[0])
+                paths = [row[0] for row in db.execute(
+                    "SELECT request_body_path FROM denied_request_logs WHERE request_body_path != ''"
+                )]
                 db.execute("DELETE FROM denied_request_logs")
-                return count
-        return await self._run(delete)
+                return count, paths
+        count, paths = await self._run(delete)
+        for relative_path in paths:
+            try:
+                (self.data_dir / relative_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return count
 
     async def list_base_urls(self) -> list[dict[str, Any]]:
         def query() -> list[dict[str, Any]]:
@@ -433,21 +469,30 @@ class Database:
     async def cleanup_expired(self, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
 
-        def cleanup() -> tuple[int, list[tuple[str, str]]]:
+        def cleanup() -> tuple[int, list[tuple[str, str]], list[str]]:
             with self._connect() as db:
                 rows = db.execute(
                     "SELECT request_body_path, response_body_path FROM request_logs WHERE started_at < ?",
                     (cutoff,),
                 ).fetchall()
                 db.execute("DELETE FROM request_logs WHERE started_at < ?", (cutoff,))
+                denied_paths = [row[0] for row in db.execute(
+                    "SELECT request_body_path FROM denied_request_logs WHERE started_at < ? AND request_body_path != ''",
+                    (cutoff,),
+                )]
                 db.execute("DELETE FROM denied_request_logs WHERE started_at < ?", (cutoff,))
-                return len(rows), [(row[0], row[1]) for row in rows]
+                return len(rows), [(row[0], row[1]) for row in rows], denied_paths
 
-        count, paths = await self._run(cleanup)
+        count, paths, denied_paths = await self._run(cleanup)
         for pair in paths:
             for relative_path in pair:
                 try:
                     (self.data_dir / relative_path).unlink(missing_ok=True)
                 except OSError:
                     pass
+        for relative_path in denied_paths:
+            try:
+                (self.data_dir / relative_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         return count

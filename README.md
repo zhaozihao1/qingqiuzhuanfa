@@ -6,7 +6,7 @@
 
 - 支持配置多个 `http://` / `https://` Base URL，但只允许一个生效。
 - 每个上游可单独保存 API 密钥并选择“自动替换 Authorization”；切换上游即可自动使用对应密钥。关闭时会透传客户端原始 Authorization。
-- 管理端可配置多个入口密钥；客户端通过 `Authorization: Bearer <入口密钥>` 或 `X-Relay-Key: <入口密钥>` 携带，验证通过后才会替换真实上游密钥并转发。
+- 入口密钥保护默认关闭，此时放行所有请求；开启后，客户端必须通过 `Authorization: Bearer <入口密钥>` 或 `X-Relay-Key: <入口密钥>` 携带已配置密钥，验证通过后才会替换真实上游密钥并转发。
 - 入口密钥只保存 SHA-256 摘要，页面只显示首尾各 4 位，保存后只能删除。
 - 转发地址为：`生效 Base URL + 客户端原始 path/query`。例如 Base URL 为 `https://api.example.com/v1`，客户端请求 `/chat/completions`，上游地址为 `https://api.example.com/v1/chat/completions`。
 - 使用流式读写，不等待完整响应；上游一有可读字节就立即转发，适合 SSE、chunked response 和 Agent 流式输出。
@@ -87,7 +87,7 @@ http://服务器IP:8081
 
 如果 Agent SDK 自己拼接 `/v1/...`，请将上游 Base URL 配成对应的 `/v1` 前缀。
 
-还需在“上游配置”中添加入口密钥并让 Agent 携带。无有效密钥的连接会被静默断开，其脱敏后的方法、路径、时间、客户端 IP 和请求头可在“拒绝统计”查看。
+还需在“上游配置”中添加入口密钥并让 Agent 携带。保护开启后，无有效密钥的连接会被静默断开；其方法、路径、时间、客户端 IP、脱敏请求头和最多 1 MiB 请求体可在“拒绝统计”查看。
 
 ## HTTPS 记录配置
 

@@ -152,13 +152,14 @@ async def test_invalid_access_key_is_silently_disconnected_and_logged(tmp_path: 
     database = Database(tmp_path / "data")
     await database.initialize()
     await database.add_access_key("client", "valid-relay-key")
+    await database.set_settings({"access_key_enabled": "true"})
     async with ClientSession() as upstream_session:
         relay_app = web.Application()
         relay_app.router.add_route("*", "/{path:.*}", StreamingProxy(database, upstream_session).handle)
         async with running_app(relay_app) as relay_url:
             async with ClientSession() as client:
                 with pytest.raises((Exception, asyncio.CancelledError)):
-                    async with client.get(relay_url + "/probe", headers={"Authorization": "Bearer wrong-key"}) as response:
+                    async with client.post(relay_url + "/probe", json={"probe": "scanner-payload"}, headers={"Authorization": "Bearer wrong-key"}) as response:
                         await response.read()
     denied = await database.list_denied_logs(sort="desc", page=1, page_size=10)
     assert denied["total"] >= 1
@@ -166,6 +167,31 @@ async def test_invalid_access_key_is_silently_disconnected_and_logged(tmp_path: 
     assert detail is not None
     assert detail["incoming_url"] == "/probe"
     assert ["Authorization", "[REDACTED]"] in detail["request_headers"]
+    assert detail["request_bytes"] > 0
+    assert b"scanner-payload" in (database.data_dir / detail["request_body_path"]).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_disabled_access_key_protection_allows_requests_without_key(tmp_path: Path) -> None:
+    async def upstream_handler(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    upstream_app = web.Application()
+    upstream_app.router.add_get("/probe", upstream_handler)
+    async with running_app(upstream_app) as upstream_url:
+        database = Database(tmp_path / "data")
+        await database.initialize()
+        await database.add_base_url("test", upstream_url)
+        async with ClientSession() as upstream_session:
+            relay_app = web.Application()
+            relay_app.router.add_route("*", "/{path:.*}", StreamingProxy(database, upstream_session).handle)
+            async with running_app(relay_app) as relay_url:
+                async with ClientSession() as client:
+                    async with client.get(relay_url + "/probe") as response:
+                        assert response.status == 200
+                        assert await response.text() == "ok"
+    denied = await database.list_denied_logs(sort="desc", page=1, page_size=10)
+    assert denied["total"] == 0
 
 
 @pytest.mark.asyncio
