@@ -48,6 +48,16 @@ def _headers_for_log(raw_headers: tuple[tuple[bytes, bytes], ...]) -> list[list[
     return [[name.decode("latin-1"), "[REDACTED]" if name.lower() in {b"authorization", b"proxy-authorization"} else value.decode("latin-1")] for name, value in raw_headers]
 
 
+def _provided_access_key(request: web.Request) -> str:
+    explicit = request.headers.get("X-Relay-Key", "").strip()
+    if explicit:
+        return explicit
+    authorization = request.headers.get("Authorization", "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
 def build_upstream_url(base_url: str, raw_path: str) -> str:
     parsed = urlsplit(base_url)
     if (
@@ -71,6 +81,19 @@ class StreamingProxy:
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
         log_id = uuid.uuid4().hex
+        if not await self.database.access_key_allowed(_provided_access_key(request)):
+            await self.database.add_denied_log({
+                "id": log_id,
+                "started_at": started.isoformat(),
+                "method": request.method,
+                "incoming_url": request.raw_path,
+                "request_headers": _headers_for_log(request.raw_headers),
+                "client_ip": request.remote,
+            })
+            transport = request.transport
+            if transport is not None:
+                transport.close()
+            raise asyncio.CancelledError
         request_relative = f"bodies/{log_id}.request.bin"
         response_relative = f"bodies/{log_id}.response.bin"
         request_path = self.database.data_dir / request_relative
@@ -130,6 +153,7 @@ class StreamingProxy:
                 return web.Response(status=status, body=payload, content_type="application/json")
 
             headers = _filtered_headers(request.raw_headers, request=True)
+            headers.popall("X-Relay-Key", None)
             parsed = urlsplit(base_url)
             headers["Host"] = parsed.netloc
             if upstream and upstream.get("auto_replace_key") and upstream.get("api_key"):

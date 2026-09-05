@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+
+def _hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or os.urandom(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, salt_hex, expected_hex = encoded.split("$", 2)
+        if algorithm != "scrypt":
+            return False
+        actual = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(actual, bytes.fromhex(expected_hex))
+    except (ValueError, TypeError):
+        return False
+
+
+def _access_key_hash(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 class Database:
@@ -72,6 +96,26 @@ class Database:
                     ON request_logs(started_at DESC);
                 CREATE INDEX IF NOT EXISTS request_logs_failed_started_at
                     ON request_logs(failed, started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS access_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_prefix TEXT NOT NULL,
+                    key_suffix TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS denied_request_logs (
+                    id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    incoming_url TEXT NOT NULL,
+                    request_headers TEXT NOT NULL,
+                    client_ip TEXT
+                );
+                CREATE INDEX IF NOT EXISTS denied_request_logs_started_at
+                    ON denied_request_logs(started_at DESC);
                 """
             )
             db.execute(
@@ -79,6 +123,10 @@ class Database:
             )
             db.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES('https_enabled', 'false')"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('admin_password_hash', ?)",
+                (_hash_password(os.getenv("ADMIN_PASSWORD", "admin")),),
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(base_urls)")}
             if "auto_replace_key" not in columns:
@@ -107,6 +155,128 @@ class Database:
                 )
 
         await self._run(update)
+
+    async def verify_admin_password(self, password: str) -> bool:
+        settings = await self.get_settings()
+        return _verify_password(password, settings.get("admin_password_hash", ""))
+
+    async def change_admin_password(self, old_password: str, new_password: str) -> bool:
+        if not await self.verify_admin_password(old_password):
+            return False
+        await self.set_settings({"admin_password_hash": _hash_password(new_password)})
+        return True
+
+    async def reset_platform(self) -> None:
+        def reset() -> list[tuple[str, str]]:
+            with self._connect() as db:
+                paths = [(row[0], row[1]) for row in db.execute(
+                    "SELECT request_body_path, response_body_path FROM request_logs"
+                )]
+                db.execute("DELETE FROM request_logs")
+                db.execute("DELETE FROM denied_request_logs")
+                db.execute("DELETE FROM access_keys")
+                db.execute("DELETE FROM base_urls")
+                db.execute("DELETE FROM settings")
+                db.executemany(
+                    "INSERT INTO settings(key, value) VALUES(?, ?)",
+                    [
+                        ("retention_days", "10"),
+                        ("https_enabled", "false"),
+                        ("admin_password_hash", _hash_password("admin")),
+                    ],
+                )
+                return paths
+
+        paths = await self._run(reset)
+        for pair in paths:
+            for relative_path in pair:
+                try:
+                    (self.data_dir / relative_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        for name in ("certificate.pem", "private-key.pem"):
+            try:
+                (self.data_dir / name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    async def list_access_keys(self) -> list[dict[str, Any]]:
+        def query() -> list[dict[str, Any]]:
+            with self._connect() as db:
+                return [dict(row) for row in db.execute(
+                    "SELECT id, name, key_prefix, key_suffix, created_at FROM access_keys ORDER BY id"
+                )]
+        return await self._run(query)
+
+    async def add_access_key(self, name: str, key: str) -> dict[str, Any]:
+        def insert() -> dict[str, Any]:
+            with self._connect() as db:
+                cursor = db.execute(
+                    "INSERT INTO access_keys(name, key_hash, key_prefix, key_suffix, created_at) VALUES(?, ?, ?, ?, ?)",
+                    (name, _access_key_hash(key), key[:4], key[-4:], datetime.now(UTC).isoformat()),
+                )
+                row = db.execute(
+                    "SELECT id, name, key_prefix, key_suffix, created_at FROM access_keys WHERE id=?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+                return dict(row)
+        return await self._run(insert)
+
+    async def delete_access_key(self, item_id: int) -> bool:
+        def delete() -> bool:
+            with self._connect() as db:
+                return db.execute("DELETE FROM access_keys WHERE id=?", (item_id,)).rowcount > 0
+        return await self._run(delete)
+
+    async def access_key_allowed(self, key: str) -> bool:
+        candidate = _access_key_hash(key)
+        def query() -> bool:
+            with self._connect() as db:
+                hashes = [row[0] for row in db.execute("SELECT key_hash FROM access_keys")]
+                return any(hmac.compare_digest(candidate, value) for value in hashes)
+        return await self._run(query)
+
+    async def add_denied_log(self, values: dict[str, Any]) -> None:
+        def insert() -> None:
+            with self._connect() as db:
+                db.execute(
+                    "INSERT INTO denied_request_logs(id, started_at, method, incoming_url, request_headers, client_ip) VALUES(?, ?, ?, ?, ?, ?)",
+                    (values["id"], values["started_at"], values["method"], values["incoming_url"],
+                     json.dumps(values["request_headers"], ensure_ascii=False), values.get("client_ip")),
+                )
+        await self._run(insert)
+
+    async def list_denied_logs(self, *, sort: str, page: int, page_size: int) -> dict[str, Any]:
+        def query() -> dict[str, Any]:
+            direction = "ASC" if sort == "asc" else "DESC"
+            offset = (page - 1) * page_size
+            with self._connect() as db:
+                total = int(db.execute("SELECT COUNT(*) FROM denied_request_logs").fetchone()[0])
+                rows = db.execute(
+                    f"SELECT id, started_at, method, incoming_url, client_ip FROM denied_request_logs ORDER BY started_at {direction} LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                ).fetchall()
+                return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
+        return await self._run(query)
+
+    async def get_denied_log(self, log_id: str) -> dict[str, Any] | None:
+        def query() -> dict[str, Any] | None:
+            with self._connect() as db:
+                row = db.execute("SELECT * FROM denied_request_logs WHERE id=?", (log_id,)).fetchone()
+                if not row:
+                    return None
+                result = dict(row)
+                result["request_headers"] = json.loads(result["request_headers"] or "[]")
+                return result
+        return await self._run(query)
+
+    async def delete_all_denied_logs(self) -> int:
+        def delete() -> int:
+            with self._connect() as db:
+                count = int(db.execute("SELECT COUNT(*) FROM denied_request_logs").fetchone()[0])
+                db.execute("DELETE FROM denied_request_logs")
+                return count
+        return await self._run(delete)
 
     async def list_base_urls(self) -> list[dict[str, Any]]:
         def query() -> list[dict[str, Any]]:
@@ -270,6 +440,7 @@ class Database:
                     (cutoff,),
                 ).fetchall()
                 db.execute("DELETE FROM request_logs WHERE started_at < ?", (cutoff,))
+                db.execute("DELETE FROM denied_request_logs WHERE started_at < ?", (cutoff,))
                 return len(rows), [(row[0], row[1]) for row in rows]
 
         count, paths = await self._run(cleanup)

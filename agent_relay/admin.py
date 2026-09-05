@@ -30,7 +30,7 @@ PEM_PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY---
 class Auth:
     def __init__(self, data_dir: Path) -> None:
         self.username = os.getenv("ADMIN_USERNAME", "admin")
-        self.password = os.getenv("ADMIN_PASSWORD", "admin")
+        self.data_dir = data_dir
         secret_path = data_dir / "session.secret"
         if not secret_path.exists():
             secret_path.write_bytes(secrets.token_bytes(32))
@@ -50,6 +50,15 @@ class Auth:
         encoded = base64.urlsafe_b64encode(payload).rstrip(b"=")
         signature = hmac.new(self.secret, encoded, hashlib.sha256).digest()
         return f"{encoded.decode()}.{base64.urlsafe_b64encode(signature).decode()}", csrf
+
+    def rotate_secret(self) -> None:
+        self.secret = secrets.token_bytes(32)
+        path = self.data_dir / "session.secret"
+        path.write_bytes(self.secret)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
     def verify(self, token: str | None) -> dict[str, Any] | None:
         if not token or "." not in token:
@@ -80,12 +89,7 @@ class Auth:
 
 
 class AdminServer:
-    def __init__(
-        self,
-        database: Database,
-        static_dir: Path,
-        reload_tls: Callable[[], Awaitable[None]],
-    ) -> None:
+    def __init__(self, database: Database, static_dir: Path, reload_tls: Callable[[], Awaitable[None]]) -> None:
         self.database = database
         self.static_dir = static_dir
         self.reload_tls = reload_tls
@@ -93,7 +97,7 @@ class AdminServer:
 
     @web.middleware
     async def auth_middleware(self, request: web.Request, handler: Callable[..., Awaitable[web.StreamResponse]]) -> web.StreamResponse:
-        public = {"/api/health", "/api/login"}
+        public = {"/api/health", "/api/login", "/api/forgot-password"}
         if request.path in public or not request.path.startswith("/api/"):
             return await handler(request)
         session = self.auth.verify(request.cookies.get(SESSION_COOKIE))
@@ -107,28 +111,25 @@ class AdminServer:
 
     def create_app(self) -> web.Application:
         app = web.Application(middlewares=[self.auth_middleware], client_max_size=10 * 1024 * 1024)
-        app.add_routes(
-            [
-                web.get("/", self.index),
-                web.get("/api/health", self.health),
-                web.post("/api/login", self.login),
-                web.post("/api/logout", self.logout),
-                web.get("/api/session", self.session),
-                web.get("/api/config", self.get_config),
-                web.post("/api/base-urls", self.add_base_url),
-                web.put(r"/api/base-urls/{item_id:\d+}", self.update_base_url),
-                web.post(r"/api/base-urls/{item_id:\d+}/activate", self.activate_base_url),
-                web.delete(r"/api/base-urls/{item_id:\d+}", self.delete_base_url),
-                web.put("/api/settings/retention", self.set_retention),
-                web.put("/api/settings/tls", self.set_tls),
-                web.get("/api/update/check", self.check_update),
-                web.post("/api/update/apply", self.apply_update),
-                web.get("/api/logs", self.list_logs),
-                web.delete("/api/logs", self.delete_all_logs),
-                web.get(r"/api/logs/{log_id:[a-f0-9]{32}}", self.get_log),
-                web.get(r"/api/logs/{log_id:[a-f0-9]{32}}/{kind:request|response}-body", self.get_body),
-            ]
-        )
+        app.add_routes([
+            web.get("/", self.index), web.get("/api/health", self.health),
+            web.post("/api/login", self.login), web.post("/api/forgot-password", self.forgot_password),
+            web.post("/api/logout", self.logout), web.get("/api/session", self.session),
+            web.put("/api/settings/password", self.change_password), web.get("/api/config", self.get_config),
+            web.post("/api/access-keys", self.add_access_key),
+            web.delete(r"/api/access-keys/{item_id:\d+}", self.delete_access_key),
+            web.post("/api/base-urls", self.add_base_url),
+            web.put(r"/api/base-urls/{item_id:\d+}", self.update_base_url),
+            web.post(r"/api/base-urls/{item_id:\d+}/activate", self.activate_base_url),
+            web.delete(r"/api/base-urls/{item_id:\d+}", self.delete_base_url),
+            web.put("/api/settings/retention", self.set_retention), web.put("/api/settings/tls", self.set_tls),
+            web.get("/api/update/check", self.check_update), web.post("/api/update/apply", self.apply_update),
+            web.get("/api/logs", self.list_logs), web.delete("/api/logs", self.delete_all_logs),
+            web.get(r"/api/logs/{log_id:[a-f0-9]{32}}", self.get_log),
+            web.get(r"/api/logs/{log_id:[a-f0-9]{32}}/{kind:request|response}-body", self.get_body),
+            web.get("/api/denied-logs", self.list_denied_logs), web.delete("/api/denied-logs", self.delete_all_denied_logs),
+            web.get(r"/api/denied-logs/{log_id:[a-f0-9]{32}}", self.get_denied_log),
+        ])
         return app
 
     async def index(self, request: web.Request) -> web.FileResponse:
@@ -136,42 +137,6 @@ class AdminServer:
 
     async def health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
-
-    async def check_update(self, request: web.Request) -> web.Response:
-        """Report the configured update command without executing it."""
-        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
-        return web.json_response({
-            "configured": bool(command),
-            "message": (
-                "Update command is configured."
-                if command else
-                "Configure RELAY_UPDATE_COMMAND to change the controlled update command."
-            ),
-        })
-
-    async def apply_update(self, request: web.Request) -> web.Response:
-        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
-        if not command:
-            raise web.HTTPConflict(
-                text=json.dumps({"error": "RELAY_UPDATE_COMMAND is not configured"}),
-                content_type="application/json",
-            )
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run, command, shell=True, capture_output=True, text=True, timeout=300, check=False
-            )
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            raise web.HTTPBadGateway(
-                text=json.dumps({"error": f"Update command failed: {exc}"}),
-                content_type="application/json",
-            )
-        output = (result.stdout + result.stderr).strip()[-4000:]
-        if result.returncode != 0:
-            raise web.HTTPBadGateway(
-                text=json.dumps({"error": "Update command returned a failure", "output": output}),
-                content_type="application/json",
-            )
-        return web.json_response({"ok": True, "output": output})
 
     async def login(self, request: web.Request) -> web.Response:
         client_ip = request.remote or "unknown"
@@ -182,21 +147,36 @@ class AdminServer:
         except (json.JSONDecodeError, ValueError):
             raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid JSON"}), content_type="application/json")
         username_ok = hmac.compare_digest(str(body.get("username", "")), self.auth.username)
-        password_ok = hmac.compare_digest(str(body.get("password", "")), self.auth.password)
+        password_ok = await self.database.verify_admin_password(str(body.get("password", "")))
         if not (username_ok and password_ok):
             self.auth.record_failure(client_ip)
             raise web.HTTPUnauthorized(text=json.dumps({"error": "Invalid username or password"}), content_type="application/json")
         token, csrf = self.auth.create_token()
         response = web.json_response({"username": self.auth.username, "csrf": csrf})
-        response.set_cookie(
-            SESSION_COOKIE,
-            token,
-            httponly=True,
-            secure=request.secure,
-            samesite="Strict",
-            max_age=12 * 60 * 60,
-            path="/",
-        )
+        response.set_cookie(SESSION_COOKIE, token, httponly=True, secure=request.secure, samesite="Strict", max_age=43200, path="/")
+        return response
+
+    async def forgot_password(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid JSON"}), content_type="application/json")
+        if body.get("confirm") != "RESET ALL DATA":
+            raise web.HTTPBadRequest(text=json.dumps({"error": "Reset confirmation is required"}), content_type="application/json")
+        await self.database.reset_platform()
+        self.auth.rotate_secret()
+        return web.json_response({"ok": True})
+
+    async def change_password(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        old_password, new_password = str(body.get("old_password", "")), str(body.get("new_password", ""))
+        if len(new_password) < 8 or len(new_password) > 128:
+            raise web.HTTPBadRequest(text=json.dumps({"error": "New password must be 8-128 characters"}), content_type="application/json")
+        if not await self.database.change_admin_password(old_password, new_password):
+            raise web.HTTPUnauthorized(text=json.dumps({"error": "Old password is incorrect"}), content_type="application/json")
+        self.auth.rotate_secret()
+        response = web.json_response({"ok": True})
+        response.del_cookie(SESSION_COOKIE, path="/")
         return response
 
     async def logout(self, request: web.Request) -> web.Response:
@@ -210,37 +190,48 @@ class AdminServer:
 
     async def get_config(self, request: web.Request) -> web.Response:
         settings = await self.database.get_settings()
-        certificate_path = self.database.data_dir / "certificate.pem"
-        private_key_path = self.database.data_dir / "private-key.pem"
-        certificate = certificate_path.read_text(encoding="utf-8") if certificate_path.exists() else ""
-        private_key = private_key_path.read_text(encoding="utf-8") if private_key_path.exists() else ""
+        cert_path, key_path = self.database.data_dir / "certificate.pem", self.database.data_dir / "private-key.pem"
         base_urls = await self.database.list_base_urls()
         for item in base_urls:
             item["api_key_configured"] = bool(item.pop("api_key", ""))
-            item["api_key"] = ""
-        return web.json_response(
-            {
-                "base_urls": base_urls,
-                "retention_days": int(settings.get("retention_days", "10")),
-                "https_enabled": settings.get("https_enabled") == "true",
-                "certificate_configured": (self.database.data_dir / "certificate.pem").exists(),
-                "certificate": certificate,
-                "private_key": private_key,
-                "default_credentials": self.auth.username == "admin" and self.auth.password == "admin",
-            }
-        )
+        access_keys = await self.database.list_access_keys()
+        for item in access_keys:
+            item["masked_key"] = f"{item.pop('key_prefix')}••••••••{item.pop('key_suffix')}"
+        return web.json_response({
+            "base_urls": base_urls, "access_keys": access_keys,
+            "retention_days": int(settings.get("retention_days", "10")),
+            "https_enabled": settings.get("https_enabled") == "true",
+            "certificate_configured": cert_path.exists() and key_path.exists(),
+            "certificate": cert_path.read_text(encoding="utf-8") if cert_path.exists() else "", "private_key": "",
+            "default_credentials": self.auth.username == "admin" and await self.database.verify_admin_password("admin"),
+        })
+
+    async def add_access_key(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        name, key = str(body.get("name", "")).strip(), str(body.get("key", "")).strip()
+        if not name or len(name) > 100 or not 8 <= len(key) <= 512:
+            raise web.HTTPBadRequest(text=json.dumps({"error": "Name is required and key must be 8-512 characters"}), content_type="application/json")
+        try:
+            item = await self.database.add_access_key(name, key)
+        except sqlite3.IntegrityError:
+            raise web.HTTPConflict(text=json.dumps({"error": "Access key already exists"}), content_type="application/json")
+        item["masked_key"] = f"{item.pop('key_prefix')}••••••••{item.pop('key_suffix')}"
+        return web.json_response(item, status=201)
+
+    async def delete_access_key(self, request: web.Request) -> web.Response:
+        if not await self.database.delete_access_key(int(request.match_info["item_id"])):
+            raise web.HTTPNotFound()
+        return web.json_response({"ok": True})
 
     async def add_base_url(self, request: web.Request) -> web.Response:
         body = await request.json()
-        name = str(body.get("name", "")).strip()
-        url = str(body.get("url", "")).strip().rstrip("/")
-        api_key = str(body.get("api_key", "")).strip()
-        auto_replace_key = bool(body.get("auto_replace_key"))
+        name, url = str(body.get("name", "")).strip(), str(body.get("url", "")).strip().rstrip("/")
+        api_key, auto_replace_key = str(body.get("api_key", "")).strip(), bool(body.get("auto_replace_key"))
         parsed = urlsplit(url)
         if not name or len(name) > 100:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Name is required (max 100 characters)"}), content_type="application/json")
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
-            raise web.HTTPBadRequest(text=json.dumps({"error": "A valid HTTP/HTTPS base URL without credentials, query, or fragment is required"}), content_type="application/json")
+            raise web.HTTPBadRequest(text=json.dumps({"error": "A valid HTTP/HTTPS base URL is required"}), content_type="application/json")
         try:
             item = await self.database.add_base_url(name, url, auto_replace_key, api_key)
         except sqlite3.IntegrityError:
@@ -249,10 +240,8 @@ class AdminServer:
         return web.json_response(item, status=201)
 
     async def update_base_url(self, request: web.Request) -> web.Response:
-        item_id = int(request.match_info["item_id"])
-        body = await request.json()
-        name = str(body.get("name", "")).strip()
-        url = str(body.get("url", "")).strip().rstrip("/")
+        item_id, body = int(request.match_info["item_id"]), await request.json()
+        name, url = str(body.get("name", "")).strip(), str(body.get("url", "")).strip().rstrip("/")
         api_key = str(body["api_key"]).strip() if "api_key" in body else None
         parsed = urlsplit(url)
         if not name or len(name) > 100 or parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
@@ -280,64 +269,70 @@ class AdminServer:
         if not 1 <= days <= 3650:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Retention must be between 1 and 3650 days"}), content_type="application/json")
         await self.database.set_settings({"retention_days": str(days)})
-        deleted = await self.database.cleanup_expired(days)
-        return web.json_response({"ok": True, "deleted": deleted})
+        return web.json_response({"ok": True, "deleted": await self.database.cleanup_expired(days)})
 
     async def set_tls(self, request: web.Request) -> web.Response:
-        body = await request.json()
+        body, enabled = await request.json(), False
         enabled = bool(body.get("enabled"))
-        cert_path = self.database.data_dir / "certificate.pem"
-        key_path = self.database.data_dir / "private-key.pem"
+        cert_path, key_path = self.database.data_dir / "certificate.pem", self.database.data_dir / "private-key.pem"
         if enabled:
-            certificate = str(body.get("certificate", "")).strip()
-            private_key = str(body.get("private_key", "")).strip()
+            certificate, private_key = str(body.get("certificate", "")).strip(), str(body.get("private_key", "")).strip()
             if certificate or private_key:
+                if not certificate:
+                    certificate = cert_path.read_text(encoding="utf-8") if cert_path.exists() else ""
+                if not private_key:
+                    private_key = key_path.read_text(encoding="utf-8") if key_path.exists() else ""
                 if not PEM_CERTIFICATE.fullmatch(certificate) or not PEM_PRIVATE_KEY.fullmatch(private_key):
                     raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid PEM certificate or private key"}), content_type="application/json")
-                temporary_cert = self.database.data_dir / ".certificate.pem.tmp"
-                temporary_key = self.database.data_dir / ".private-key.pem.tmp"
+                temporary_cert, temporary_key = self.database.data_dir / ".certificate.pem.tmp", self.database.data_dir / ".private-key.pem.tmp"
                 temporary_cert.write_text(certificate + "\n", encoding="utf-8")
                 temporary_key.write_text(private_key + "\n", encoding="utf-8")
                 try:
                     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
                     context.load_cert_chain(temporary_cert, temporary_key)
-                    temporary_cert.replace(cert_path)
-                    temporary_key.replace(key_path)
-                    try:
-                        key_path.chmod(0o600)
-                    except OSError:
-                        pass
+                    temporary_cert.replace(cert_path); temporary_key.replace(key_path); key_path.chmod(0o600)
                 except (ssl.SSLError, OSError) as exc:
-                    temporary_cert.unlink(missing_ok=True)
-                    temporary_key.unlink(missing_ok=True)
+                    temporary_cert.unlink(missing_ok=True); temporary_key.unlink(missing_ok=True)
                     raise web.HTTPBadRequest(text=json.dumps({"error": f"Certificate validation failed: {exc}"}), content_type="application/json")
             elif not cert_path.exists() or not key_path.exists():
                 raise web.HTTPBadRequest(text=json.dumps({"error": "Certificate and private key are required"}), content_type="application/json")
         await self.database.set_settings({"https_enabled": "true" if enabled else "false"})
-        loop = asyncio.get_running_loop()
-        loop.call_later(0.5, lambda: loop.create_task(self.reload_tls()))
+        loop = asyncio.get_running_loop(); loop.call_later(0.5, lambda: loop.create_task(self.reload_tls()))
         return web.json_response({"ok": True, "reconnecting": True})
 
-    async def list_logs(self, request: web.Request) -> web.Response:
-        failed_only = request.query.get("failed") == "true"
-        sort = "asc" if request.query.get("sort") == "asc" else "desc"
+    async def check_update(self, request: web.Request) -> web.Response:
+        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
+        return web.json_response({"configured": bool(command), "message": "Update command is configured." if command else "Configure RELAY_UPDATE_COMMAND."})
+
+    async def apply_update(self, request: web.Request) -> web.Response:
+        command = os.getenv("RELAY_UPDATE_COMMAND", DEFAULT_UPDATE_COMMAND).strip()
+        if not command:
+            raise web.HTTPConflict(text=json.dumps({"error": "RELAY_UPDATE_COMMAND is not configured"}), content_type="application/json")
         try:
-            page = max(1, int(request.query.get("page", "1")))
-            page_size = min(100, max(1, int(request.query.get("page_size", "30"))))
+            result = await asyncio.to_thread(subprocess.run, command, shell=True, capture_output=True, text=True, timeout=300, check=False)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise web.HTTPBadGateway(text=json.dumps({"error": f"Update command failed: {exc}"}), content_type="application/json")
+        output = (result.stdout + result.stderr).strip()[-4000:]
+        if result.returncode != 0:
+            raise web.HTTPBadGateway(text=json.dumps({"error": "Update command returned a failure", "output": output}), content_type="application/json")
+        return web.json_response({"ok": True, "output": output})
+
+    async def list_logs(self, request: web.Request) -> web.Response:
+        failed_only, sort = request.query.get("failed") == "true", "asc" if request.query.get("sort") == "asc" else "desc"
+        try:
+            page, page_size = max(1, int(request.query.get("page", "1"))), min(100, max(1, int(request.query.get("page_size", "30"))))
         except ValueError:
             raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid pagination"}), content_type="application/json")
         return web.json_response(await self.database.list_logs(failed_only=failed_only, sort=sort, page=page, page_size=page_size))
 
     async def delete_all_logs(self, request: web.Request) -> web.Response:
-        deleted = await self.database.delete_all_logs()
-        return web.json_response({"ok": True, "deleted": deleted})
+        return web.json_response({"ok": True, "deleted": await self.database.delete_all_logs()})
 
     async def get_log(self, request: web.Request) -> web.Response:
         item = await self.database.get_log(request.match_info["log_id"])
         if not item:
             raise web.HTTPNotFound()
-        item.pop("request_body_path", None)
-        item.pop("response_body_path", None)
+        item.pop("request_body_path", None); item.pop("response_body_path", None)
         return web.json_response(item)
 
     async def get_body(self, request: web.Request) -> web.StreamResponse:
@@ -345,21 +340,30 @@ class AdminServer:
         if not item:
             raise web.HTTPNotFound()
         kind = request.match_info["kind"]
-        relative_path = item[f"{kind}_body_path"]
-        path = (self.database.data_dir / relative_path).resolve()
+        path = (self.database.data_dir / item[f"{kind}_body_path"]).resolve()
         if self.database.data_dir.resolve() not in path.parents or not path.is_file():
             raise web.HTTPNotFound()
-        content_type = "application/octet-stream"
-        content_encoding = None
-        headers = item[f"{kind}_headers"]
-        for name, value in headers:
-            if name.lower() == "content-type":
-                content_type = value
-            elif name.lower() == "content-encoding":
-                content_encoding = value
-        outgoing_headers = {"Content-Type": content_type, "Content-Disposition": "inline"}
-        if content_encoding:
-            # Logged bodies contain the exact encoded upstream bytes. Restoring
-            # this header lets browsers decode gzip/br content before displaying it.
-            outgoing_headers["Content-Encoding"] = content_encoding
-        return web.FileResponse(path, headers=outgoing_headers)
+        content_type, content_encoding = "application/octet-stream", None
+        for name, value in item[f"{kind}_headers"]:
+            if name.lower() == "content-type": content_type = value
+            elif name.lower() == "content-encoding": content_encoding = value
+        headers = {"Content-Type": content_type, "Content-Disposition": "inline"}
+        if content_encoding: headers["Content-Encoding"] = content_encoding
+        return web.FileResponse(path, headers=headers)
+
+    async def list_denied_logs(self, request: web.Request) -> web.Response:
+        sort = "asc" if request.query.get("sort") == "asc" else "desc"
+        try:
+            page, page_size = max(1, int(request.query.get("page", "1"))), min(100, max(1, int(request.query.get("page_size", "30"))))
+        except ValueError:
+            raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid pagination"}), content_type="application/json")
+        return web.json_response(await self.database.list_denied_logs(sort=sort, page=page, page_size=page_size))
+
+    async def delete_all_denied_logs(self, request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "deleted": await self.database.delete_all_denied_logs()})
+
+    async def get_denied_log(self, request: web.Request) -> web.Response:
+        item = await self.database.get_denied_log(request.match_info["log_id"])
+        if not item:
+            raise web.HTTPNotFound()
+        return web.json_response(item)

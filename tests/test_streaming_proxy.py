@@ -58,6 +58,7 @@ async def test_sse_reasoning_and_tool_deltas_arrive_before_stream_ends(tmp_path:
     async with running_app(upstream_app) as upstream_url:
         database = Database(tmp_path / "data")
         await database.initialize()
+        await database.add_access_key("test", "relay-test-key")
         await database.add_base_url("test", f"{upstream_url}/v1")
         async with ClientSession(
             connector=TCPConnector(limit=0), auto_decompress=False
@@ -69,7 +70,8 @@ async def test_sse_reasoning_and_tool_deltas_arrive_before_stream_ends(tmp_path:
             async with running_app(relay_app) as relay_url:
                 async with ClientSession(auto_decompress=False) as client:
                     async with client.post(
-                        f"{relay_url}/chat/completions", json={"stream": True}
+                        f"{relay_url}/chat/completions", json={"stream": True},
+                        headers={"X-Relay-Key": "relay-test-key"},
                     ) as response:
                         await asyncio.wait_for(first_sent.wait(), timeout=2)
                         received_first = await asyncio.wait_for(
@@ -143,3 +145,51 @@ async def test_admin_body_restores_content_encoding(tmp_path: Path) -> None:
                 assert response.headers["Content-Encoding"] == "gzip"
                 assert response.headers["Content-Type"] == "text/event-stream; charset=utf-8"
                 assert await response.read() == response_body
+
+
+@pytest.mark.asyncio
+async def test_invalid_access_key_is_silently_disconnected_and_logged(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data")
+    await database.initialize()
+    await database.add_access_key("client", "valid-relay-key")
+    async with ClientSession() as upstream_session:
+        relay_app = web.Application()
+        relay_app.router.add_route("*", "/{path:.*}", StreamingProxy(database, upstream_session).handle)
+        async with running_app(relay_app) as relay_url:
+            async with ClientSession() as client:
+                with pytest.raises((Exception, asyncio.CancelledError)):
+                    async with client.get(relay_url + "/probe", headers={"Authorization": "Bearer wrong-key"}) as response:
+                        await response.read()
+    denied = await database.list_denied_logs(sort="desc", page=1, page_size=10)
+    assert denied["total"] >= 1
+    detail = await database.get_denied_log(denied["items"][0]["id"])
+    assert detail is not None
+    assert detail["incoming_url"] == "/probe"
+    assert ["Authorization", "[REDACTED]"] in detail["request_headers"]
+
+
+@pytest.mark.asyncio
+async def test_change_and_forgot_password_reset_all_data(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data")
+    await database.initialize()
+    await database.add_access_key("client", "valid-relay-key")
+    await database.add_base_url("test", "https://example.test/v1")
+
+    async def no_reload() -> None:
+        return None
+
+    admin = AdminServer(database, tmp_path, no_reload)
+    async with running_app(admin.create_app()) as admin_url:
+        async with ClientSession(cookie_jar=CookieJar(unsafe=True)) as client:
+            async with client.post(admin_url + "/api/login", json={"username": "admin", "password": "admin"}) as response:
+                csrf = (await response.json())["csrf"]
+            async with client.put(admin_url + "/api/settings/password", json={"old_password": "admin", "new_password": "new-password"}, headers={"X-CSRF-Token": csrf}) as response:
+                assert response.status == 200
+            async with client.post(admin_url + "/api/login", json={"username": "admin", "password": "new-password"}) as response:
+                assert response.status == 200
+            async with client.post(admin_url + "/api/forgot-password", json={"confirm": "RESET ALL DATA"}) as response:
+                assert response.status == 200
+            async with client.post(admin_url + "/api/login", json={"username": "admin", "password": "admin"}) as response:
+                assert response.status == 200
+    assert await database.list_access_keys() == []
+    assert await database.list_base_urls() == []
